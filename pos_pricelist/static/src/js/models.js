@@ -74,57 +74,21 @@ function pos_pricelist_models(instance, module) {
     });
 
     /**
-     * Extend the order
+     * Extend the Order
      */
+    var moduleOrderParent = module.Order;
     module.Order = module.Order.extend({
-        /**
-         * override this method to merge lines
-         * TODO : Need some refactoring in the standard POS to Do it better
-         * TODO : from line 73 till 85, we need to move this to another method
-         * @param product
-         * @param options
-         */
-        addProduct: function (product, options) {
-            options = options || {};
-            var attr = JSON.parse(JSON.stringify(product));
-            attr.pos = this.pos;
-            attr.order = this;
-            var line = new module.Orderline({}, {
-                pos: this.pos,
-                order: this,
-                product: product
-            });
-            var self = this;
-            var found = false;
-
-            if (options.quantity !== undefined) {
-                line.set_quantity(options.quantity);
+        export_as_JSON: function() {
+            var order = moduleOrderParent.prototype.export_as_JSON.apply(this, arguments);
+            partner = this.get_client();
+            if (partner && partner.property_product_pricelist) {
+                pricelist_id = partner.property_product_pricelist[0];
+            } else {
+                pricelist_id = this.pos.config.pricelist_id[0];
             }
-            if (options.price !== undefined) {
-                line.set_unit_price(options.price);
-            }
-            if (options.discount !== undefined) {
-                line.set_discount(options.discount);
-            }
-
-            var orderlines = [];
-            if (self.get('orderLines').models !== undefined) {
-                orderlines = self.get('orderLines').models;
-            }
-            for (var i = 0; i < orderlines.length; i++) {
-                var _line = orderlines[i];
-                if (_line && _line.can_be_merged_with(line) &&
-                    options.merge !== false) {
-                    _line.merge(line);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                this.get('orderLines').add(line);
-            }
-            this.selectLine(this.getLastOrderline());
-        }
+            order['pricelist_id'] =  pricelist_id;
+            return order;
+        },
     });
 
     /**
@@ -381,6 +345,62 @@ function pos_pricelist_models(instance, module) {
             }
             return version;
         },
+
+        /**
+         * Check if a pricelist rule can be used
+         * @param item
+         * @param product
+         * @param version
+         * @returns {boolean}
+         */
+        rule_match: function (db, item, product, qty, version) {
+          // get categories
+          var categ_ids = [];
+          if (product.categ_id) {
+              categ_ids.push(product.categ_id[0]);
+              categ_ids = categ_ids.concat(
+                  db.product_category_ancestors[product.categ_id[0]]
+              );
+          }
+
+          var cond = true
+          var template_false = item.product_tmpl_id === false
+          var product_false = item.product_id === false
+          var template_match = (
+            !template_false &&
+            item.product_tmpl_id[0] ===  product.product_tmpl_id
+          )
+          var product_match = (
+            !product_false &&
+            item.product_id[0] === product.id
+          )
+
+          // Check if products/template combination is possible
+          cond = cond && (
+            (product_false && template_false) ||
+            (product_match && (template_false || template_match)) ||
+            (template_match && product_false)
+          )
+
+          // Check category
+          cond = cond && (
+              item.categ_id === false ||
+              categ_ids.indexOf(item.categ_id[0]) !== -1
+          )
+
+          // Check version
+          cond = cond && (
+              item.price_version_id[0] === version.id
+          )
+
+          // Check product qty
+          cond = cond && (
+            !item.min_quantity ||
+            qty >= item.min_quantity
+          )
+
+          return cond
+        },
         /**
          * compute the price for the given product
          * @param database
@@ -405,25 +425,13 @@ function pos_pricelist_models(instance, module) {
                 return false;
             }
 
-            // get categories
-            var categ_ids = [];
-            if (product.categ_id) {
-                categ_ids.push(product.categ_id[0]);
-                categ_ids = categ_ids.concat(
-                    db.product_category_ancestors[product.categ_id[0]]
-                );
-            }
 
             // find items
             var items = [], i, len;
             for (i = 0, len = db.pricelist_item_sorted.length; i < len; i++) {
                 var item = db.pricelist_item_sorted[i];
-                if ((item.product_id === false
-                    || item.product_id[0] === product.id) &&
-                    (item.categ_id === false
-                    || categ_ids.indexOf(item.categ_id[0]) !== -1) &&
-                    (item.price_version_id[0] === version.id)) {
-                    items.push(item);
+                if (this.rule_match(db, item, product, qty, version)) {
+                  items.push(item)
                 }
             }
 
@@ -436,13 +444,6 @@ function pos_pricelist_models(instance, module) {
             for (i = 0, len = items.length; i < len; i++) {
                 var rule = items[i];
 
-                if (rule.min_quantity && qty < rule.min_quantity) {
-                    continue;
-                }
-                if (rule.product_id && rule.product_id[0]
-                    && product.id != rule.product_id[0]) {
-                    continue;
-                }
                 if (rule.categ_id) {
                     var cat_id = product.categ_id[0];
                     while (cat_id) {
@@ -455,6 +456,7 @@ function pos_pricelist_models(instance, module) {
                         continue;
                     }
                 }
+
                 // Based on field
                 switch (rule.base) {
                     case -1:
@@ -723,11 +725,17 @@ function pos_pricelist_models(instance, module) {
                         'name',
                         'version_id',
                         'currency_id'],
-                    domain: function () {
+                    domain: function (self) {
                         return [
-                            ['type', '=', 'sale']
+                            '|',
+                            '|',
+                            ['id', '=', self.config.pricelist_id[0]],
+                            ['pos_config_ids', '=', false],
+                            ['pos_config_ids', 'in', [self.config.id]],
+                            ['type', '=', 'sale'],
                         ]
                     },
+                    context: function(self){ return { pos_config_id: self.config.id }; },
                     loaded: function (self, pricelists) {
                         self.db.add_pricelists(pricelists);
                     }
@@ -739,7 +747,12 @@ function pos_pricelist_models(instance, module) {
                         'date_start',
                         'date_end',
                         'items'],
-                    domain: null,
+                    domain: function (self) {
+                        var pricelist_ids = _.map(_.keys(self.db.pricelist_by_id), function(el){return parseInt(el)});
+                        return [
+                            ['pricelist_id', 'in', pricelist_ids]
+                        ]
+                    },
                     loaded: function (self, versions) {
                         self.db.add_pricelist_versions(versions);
                     }
@@ -761,7 +774,12 @@ function pos_pricelist_models(instance, module) {
                         'product_tmpl_id',
                         'sequence'
                     ],
-                    domain: null,
+                    domain: function (self) {
+                        var version_ids = _.map(_.keys(self.db.pricelist_version_by_id), function (el){return parseInt(el);});
+                        return [
+                            ['price_version_id', 'in', version_ids]
+                        ];
+                    },
                     loaded: function (self, items) {
                         self.db.add_pricelist_items(items);
                     }
